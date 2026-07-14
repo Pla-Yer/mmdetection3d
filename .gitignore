@@ -111,6 +111,7 @@ data
 .idea
 
 # custom
+.codeartsdoer/
 *.pkl
 *.pkl.json
 *.log.json

@@ -14,16 +14,22 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures import Det3DDataSample
 from mmdet3d.utils import OptConfigType, OptMultiConfig, OptSampleList
 from .ops import Voxelization
+import sys
+import os.path as osp
+# PyTorch 2.6+ weights_only 补丁（你已有）
+sys.path.insert(0, osp.dirname(__file__))
+# import fix_pytorch_weights_only  # noqa
 
 
 @MODELS.register_module()
-class BEVFusion(Base3DDetector):
+class DFBEVFusion(Base3DDetector):
 
     def __init__(
         self,
         data_preprocessor: OptConfigType = None,
         pts_voxel_encoder: Optional[dict] = None,
         pts_middle_encoder: Optional[dict] = None,
+        pts_middle_adapter: Optional[dict] = None,
         fusion_layer: Optional[dict] = None,
         img_backbone: Optional[dict] = None,
         pts_backbone: Optional[dict] = None,
@@ -51,6 +57,8 @@ class BEVFusion(Base3DDetector):
         self.view_transform = MODELS.build(
             view_transform) if view_transform is not None else None
         self.pts_middle_encoder = MODELS.build(pts_middle_encoder)
+        self.pts_middle_adapter = MODELS.build(
+            pts_middle_adapter) if pts_middle_adapter is not None else None
 
         self.fusion_layer = MODELS.build(
             fusion_layer) if fusion_layer is not None else None
@@ -162,14 +170,33 @@ class BEVFusion(Base3DDetector):
                 img_metas,
             )
         return x
+    # source
+    # def extract_pts_feat(self, batch_inputs_dict) -> torch.Tensor:
+    #     points = batch_inputs_dict['points']
+    #     with torch.autocast('cuda', enabled=False):
+    #         points = [point.float() for point in points]
+    #         feats, coords, sizes = self.voxelize(points)
+    #         batch_size = coords[-1, 0] + 1
+    #     x = self.pts_middle_encoder(feats, coords, batch_size)
+    #     return x
 
+    # change by player to fit pillar_scatter
     def extract_pts_feat(self, batch_inputs_dict) -> torch.Tensor:
         points = batch_inputs_dict['points']
         with torch.autocast('cuda', enabled=False):
-            points = [point.float() for point in points]
-            feats, coords, sizes = self.voxelize(points)
-            batch_size = coords[-1, 0] + 1
-        x = self.pts_middle_encoder(feats, coords, batch_size)
+            points = [p.float() for p in points]
+            voxels, coords, num_points = self.voxelize(points)  # voxels: [V,M,Cin], coors: [V,4], num_points: [V]
+            batch_size = int(coords[-1, 0].item()) + 1
+
+        # 如果当前 coords 是 (b, y, x, z)，转成 (b, z, y, x)
+        coords = coords[:, [0, 3, 1, 2]].contiguous()
+        # 关键：先做 voxel encoder，把 [V,M,Cin] -> [V,Cout]
+        voxel_features = self.pts_voxel_encoder(voxels, num_points, coords)  # -> [V, Cout]
+
+        # 再 scatter 到 BEV: [B, Cout, H, W]
+        x = self.pts_middle_encoder(voxel_features, coords, batch_size)
+        if self.pts_middle_adapter is not None:
+            x = self.pts_middle_adapter(x)
         return x
 
     @torch.no_grad()
@@ -242,6 +269,7 @@ class BEVFusion(Base3DDetector):
         batch_inputs_dict,
         batch_input_metas,
         return_backbone=False,
+        return_middle=False,
         **kwargs,
     ):
         imgs = batch_inputs_dict.get('imgs', None)
@@ -279,18 +307,27 @@ class BEVFusion(Base3DDetector):
             assert len(features) == 1, features
             x = features[0]
 
+        # For the LiDAR student this is the explicit BEVDownsample output;
+        # for the sparse teacher it is the middle-encoder output.  They are
+        # the intended 256 x 180 x 180 feature-distillation boundary.
+        middle_bev_feat = x
         backbone_feats = self.pts_backbone(x)
         x = self.pts_neck(backbone_feats)
 
+        if return_backbone and return_middle:
+            return x, backbone_feats, middle_bev_feat
         if return_backbone:
             return x, backbone_feats
+        if return_middle:
+            return x, middle_bev_feat
         return x
 
     def extract_distill_features(self, batch_inputs_dict,
                                  batch_input_metas):
         """Return stable LiDAR distillation tensors without post-processing."""
-        bev_feat, backbone_feats = self.extract_feat(
-            batch_inputs_dict, batch_input_metas, return_backbone=True)
+        bev_feat, backbone_feats, middle_bev_feat = self.extract_feat(
+            batch_inputs_dict, batch_input_metas, return_backbone=True,
+            return_middle=True)
         head_outputs = self.bbox_head(bev_feat, batch_input_metas)
         dense_heatmap = head_outputs[0][0]['dense_heatmap']
         if not isinstance(bev_feat, torch.Tensor):
@@ -300,6 +337,7 @@ class BEVFusion(Base3DDetector):
             bev_feat = bev_feat[0]
         low_bev_feat = backbone_feats[0]
         return dict(
+            middle_bev_feat=middle_bev_feat,
             low_bev_feat=low_bev_feat,
             bev_feat=bev_feat,
             dense_heatmap=dense_heatmap)

@@ -3,6 +3,14 @@ import argparse
 import logging
 import os
 import os.path as osp
+import sys
+
+# When this file is executed directly (``python tools/train.py``), Python adds
+# ``tools`` rather than the repository root to sys.path.  Make the source tree
+# importable even when mmdet3d has not been installed in editable mode.
+REPO_ROOT = osp.dirname(osp.dirname(osp.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from mmengine.config import Config, DictAction
 from mmengine.logging import print_log

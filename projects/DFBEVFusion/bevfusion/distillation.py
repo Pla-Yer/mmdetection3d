@@ -446,11 +446,13 @@ class InstanceRelationDistillLoss(_InstanceDistillLoss):
             # boundary cells, otherwise they dilute the per-box average with
             # a zero contribution.
             pair_sum = pair_weight.sum(dim=(-2, -1))
-            if pair_sum <= 0:
+            valid = pair_sum.gt(0)
+            if not valid.any():
                 continue
-            difference = (student_relation - teacher_relation).abs()
-            per_box.append((difference * pair_weight).sum(dim=(-2, -1)) /
-                           pair_sum)
+            difference = (student_relation[valid] -
+                           teacher_relation[valid]).abs()
+            per_box.append((difference * pair_weight[valid]).sum(
+                dim=(-2, -1)) / pair_sum[valid])
         if not per_box:
             return student.new_zeros(())
         return self.loss_weight * torch.cat(per_box).mean()

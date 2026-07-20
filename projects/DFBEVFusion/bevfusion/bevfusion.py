@@ -324,12 +324,15 @@ class DFBEVFusion(Base3DDetector):
 
     def extract_distill_features(self, batch_inputs_dict,
                                  batch_input_metas):
-        """Return stable LiDAR distillation tensors without post-processing."""
+        """Return BEV tensors used by LiDAR distillation.
+
+        Detection-head outputs are deliberately not produced here. The
+        distiller runs the student's head exactly once and reuses those
+        predictions for the detection loss and optional heatmap KD.
+        """
         bev_feat, backbone_feats, middle_bev_feat = self.extract_feat(
             batch_inputs_dict, batch_input_metas, return_backbone=True,
             return_middle=True)
-        head_outputs = self.bbox_head(bev_feat, batch_input_metas)
-        dense_heatmap = head_outputs[0][0]['dense_heatmap']
         if not isinstance(bev_feat, torch.Tensor):
             if len(bev_feat) != 1:
                 raise ValueError(
@@ -339,8 +342,7 @@ class DFBEVFusion(Base3DDetector):
         return dict(
             middle_bev_feat=middle_bev_feat,
             low_bev_feat=low_bev_feat,
-            bev_feat=bev_feat,
-            dense_heatmap=dense_heatmap)
+            bev_feat=bev_feat)
 
     def loss(self, batch_inputs_dict: Dict[str, Optional[Tensor]],
              batch_data_samples: List[Det3DDataSample],

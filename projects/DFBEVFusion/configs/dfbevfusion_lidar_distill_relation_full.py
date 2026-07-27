@@ -96,7 +96,7 @@ model = dict(
 
 # A frozen teacher and a trainable student coexist on the GPU.  Start with one
 # sample per GPU; increase only after measuring real peak memory.
-train_dataloader = dict(batch_size=4,num_workers=4)
+train_dataloader = dict(batch_size=8,num_workers=8)
 
 randomness = dict(seed=20260719, deterministic=False)
 

@@ -1554,3 +1554,127 @@ objects beyond what gentle fine-tuning alone achieves. If the KD
 gain is considered too small to justify the teacher overhead, the
 no-KD control checkpoint (ep4, 0.6233/0.5338) is the simpler
 alternative with 86% of the total gain and no teacher dependency.
+
+### Root cause: why ep15 was best and why ep16-20 collapsed
+
+Investigation of the student's original training config revealed a
+`DisableObjectSampleHook` that disables GT-Aug (database sampling /
+copy-paste augmentation) after epoch 15:
+
+    custom_hooks = [dict(disable_after_epoch=15,
+                         type='DisableObjectSampleHook')]
+
+The hook sets `ObjectSample.disabled = True` at the start of epoch
+16 (0-indexed epoch 15). The training log confirms:
+`2026/07/19 00:56:11 - mmengine - INFO - Disable ObjectSample`
+(between ep15 and ep16).
+
+This is NOT standard overfitting. The training loss decreased from
+1.64 (ep15, GT-Aug on) to 1.21 (ep19, GT-Aug off), but the decrease
+is misleading:
+
+| Epoch | GT-Aug | training loss | validation NDS |
+|---:|---|---:|---:|
+| 15 | active | 1.64 | 0.6133 (best) |
+| 16 | disabled | 1.49 (dropped 0.15) | - |
+| 19 | disabled | 1.21 | - |
+| 20 | disabled | 1.27 | 0.4990 (collapsed) |
+
+The loss dropped because the data became EASIER (GT-Aug off = fewer
+objects per scene = lower detection loss), not because the model
+improved. The model adapted to the un-augmented distribution and
+lost the ability to detect objects in real (denser) scenes, causing
+validation NDS to collapse to 0.4990.
+
+This explains why ep15 was best (last epoch with GT-Aug) and why
+no-KD fine-tuning from ep15 still improves: the KD/no-KD configs
+set `custom_hooks = []`, keeping GT-Aug active throughout. The model
+continues training with the same rich augmented data that was used
+in ep1-15, now with a gentle lr=1e-5 cosine schedule instead of the
+high cyclic LR (5e-4 at ep15).
+
+Implication for KD attribution: part of the no-KD control's +0.0100
+NDS gain comes from "GT-Aug continues providing rich training data"
+(i.e. not disabling it at ep15), not purely from "gentle fine-tuning."
+A perfectly matched control would keep DisableObjectSampleHook active,
+but that would reproduce the ep16-20 collapse. The practical choice
+is to keep GT-Aug on; the no-KD control then represents the best
+ achievable plain fine-tuning result.
+
+## Full nuScenes: no-KD warm restart (from ep4 weights)
+
+After the 4-epoch no-KD control (0.6233 NDS) showed a stable
++0.0003-0.0004 NDS per-epoch slope with no sign of saturation, a
+warm restart was run to test whether the model was truly converged.
+
+`dfbevfusion_lidar_distill_nokd_full.py` with
+`--cfg-options load_from=...epoch_4.pth` loads the ep4 weights
+and starts a fresh 4-epoch cosine schedule (lr=1e-5, cosine end=4).
+This is a warm restart: the model weights are from ep4, but the
+optimizer state, scheduler, and epoch counter are all fresh.
+
+Note: `--resume` was initially attempted but produced LR=1e-7
+(restored the old scheduler state where cosine end=4 was already
+complete). Using `load_from` instead of `--resume` gives a fresh
+cosine that starts at 1e-5.
+
+### Result
+
+| Epoch | original no-KD (from ep15) | warm restart (from ep4) | Δ |
+|---:|---:|---:|---:|
+| 1 | 0.6223 | 0.6225 | +0.0002 |
+| 2 | 0.6226 | 0.6235 | +0.0009 |
+| 3 | 0.6229 | 0.6238 | +0.0003 |
+| 4 | 0.6233 | **0.6243** | **+0.0010** |
+
+Warm restart improved NDS from 0.6233 to 0.6243 (+0.0010). The model
+was NOT saturated; the fresh cosine with LR reset helped it find a
+better optimum. Cumulative no-KD improvement from ep15: +0.0110 NDS
+(0.6133 → 0.6243).
+
+### Updated KD attribution
+
+With the warm restart raising the no-KD baseline from 0.6233 to
+0.6243, the KD net contributions shrink dramatically:
+
+| Signal | vs original no-KD (0.6233) | vs warm restart (0.6243) |
+|---|---|---|
+| response KD | +0.0016 (14%) | **+0.0006 (5%)** |
+| relation KD | +0.0000 (0%) | **-0.0010 (negative)** |
+| joint v1 | +0.0013 (11%) | **+0.0003 (3%)** |
+
+Response KD's net contribution dropped from +0.0016 to +0.0006 NDS
+(5% of total gain). This is approaching noise level. Another warm
+restart would likely close the gap entirely.
+
+### Per-class AP@2.0 (warm restart ep4)
+
+| Class | input | original no-KD ep4 | warm restart ep4 | response ep3 |
+|---|---:|---:|---:|---:|
+| car | 0.8792 | 0.8897 | 0.8897 | 0.8864 |
+| truck | 0.6176 | 0.6286 | 0.6288 | 0.6220 |
+| construction_vehicle | 0.1762 | 0.1919 | 0.1943 | 0.1842 |
+| bus | 0.7983 | 0.8028 | 0.8037 | 0.7960 |
+| trailer | 0.3841 | 0.4007 | 0.4021 | 0.3748 |
+| barrier | 0.6744 | 0.6774 | 0.6779 | 0.6844 |
+| motorcycle | 0.4987 | 0.5176 | 0.5187 | 0.5303 |
+| bicycle | 0.2288 | 0.2639 | 0.2649 | 0.2886 |
+| pedestrian | 0.7902 | 0.8013 | 0.8029 | 0.7992 |
+| traffic_cone | 0.5953 | 0.6172 | 0.6186 | 0.6205 |
+
+Warm restart wins on large/elongated objects (trailer +0.027 vs
+response, CV +0.010, bus +0.008, truck +0.007). Response KD retains
+a residual advantage only on small/dense objects (bicycle +0.024,
+motorcycle +0.012, barrier +0.007), but this advantage is shrinking
+as plain fine-tuning continues to improve.
+
+### Conclusion
+
+The KD experiments on full nuScenes converge to a clear conclusion:
+plain fine-tuning with GT-Aug kept active and a gentle cosine LR
+accounts for 95% of the total NDS improvement. Response KD adds
+only +0.0006 NDS (5%) on top of warm-restart fine-tuning, primarily
+on small/dense objects. Relation KD provides zero or negative net
+benefit. The KD signal is real but marginal, and the deployment
+decision should weigh whether +0.0006 NDS justifies the teacher
+inference overhead.

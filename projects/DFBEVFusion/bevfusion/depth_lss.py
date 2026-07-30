@@ -328,8 +328,8 @@ class BaseDepthTransform(BaseViewTransform):
         )
 
         x = self.get_cam_feats(img, depth)
-        # x = self.bev_pool(geom, x)
-        x = self.bev_pool_scatter(geom, x)
+        x = self.bev_pool(geom, x)
+        # x = self.bev_pool_scatter(geom, x)
         return x
 
     def bev_pool_scatter(self, geom_feats, x):

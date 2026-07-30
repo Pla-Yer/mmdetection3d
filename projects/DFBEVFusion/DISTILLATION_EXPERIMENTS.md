@@ -1678,3 +1678,107 @@ on small/dense objects. Relation KD provides zero or negative net
 benefit. The KD signal is real but marginal, and the deployment
 decision should weigh whether +0.0006 NDS justifies the teacher
 inference overhead.
+
+## Full nuScenes: LiDAR-camera fusion with ResNet50
+
+`dfbevfusion_lidar-cam_voxel03_second_secfpn_resnet50_nus-full-5090.py`
+extends the validated 5090 LiDAR-only config with a ResNet50 camera
+branch and ConvFuser fusion. The LiDAR branch keeps the exact same
+architecture (PointPillarsScatter + BEVDownsample + SECOND + FPN +
+TransFusionHead) and is initialized from the warm-restart no-KD
+checkpoint (0.6243 NDS) via `load_from`. The camera branch (ResNet50
+from ImageNet + GeneralizedLSSFPN + DepthLSSTransform) starts from
+scratch.
+
+### Resolution alignment
+
+`view_transform.downsample=2` halves the camera BEV from 360x360 to
+180x180, matching the LiDAR BEV after BEVDownsample (256x180x180).
+ConvFuser fuses them: in_channels=[80, 256] → 256x180x180.
+
+### Result (6 epochs)
+
+| Epoch | NDS | mAP | loss | slope NDS |
+|---:|---:|---:|---:|---:|
+| 1 | 0.6456 | 0.5813 | 12.11 | - |
+| 2 | 0.6637 | 0.6107 | 1.41 | +0.0181 |
+| 3 | 0.6743 | 0.6306 | 1.09 | +0.0106 |
+| 4 | 0.6799 | 0.6379 | 1.22 | +0.0056 |
+| 5 | 0.6805 | 0.6389 | 1.08 | +0.0006 |
+| 6 | **0.6816** | **0.6398** | 0.99 | +0.0011 |
+
+Best: epoch 6 (NDS 0.6816 / mAP 0.6398).
+
+### Per-class AP@2.0 (ep6 vs LiDAR-only)
+
+| Class | LiDAR-only | LiDAR+Cam | Δ | camera value |
+|---|---:|---:|---:|---|
+| bicycle | 0.2649 | 0.5780 | +0.3131 | extreme |
+| motorcycle | 0.5187 | 0.7492 | +0.2305 | extreme |
+| traffic_cone | 0.6186 | 0.7587 | +0.1401 | high |
+| construction_vehicle | 0.1943 | 0.3198 | +0.1255 | high |
+| trailer | 0.4021 | 0.5082 | +0.1061 | high |
+| barrier | 0.6779 | 0.7272 | +0.0493 | medium |
+| truck | 0.6288 | 0.6818 | +0.0530 | medium |
+| pedestrian | 0.8029 | 0.8471 | +0.0442 | medium |
+| bus | 0.8037 | 0.8474 | +0.0437 | medium |
+| car | 0.8897 | 0.9187 | +0.0290 | low |
+
+All 10 classes improve. Camera fusion is the single largest
+improvement in the entire project: +0.0573 NDS / +0.1032 mAP over
+LiDAR-only, dwarfing all KD experiments (+0.0006 NDS net).
+
+## Full nuScenes: LiDAR-camera warm restart
+
+`dfbevfusion_lidar-cam_resnet50_warmrestart.py` extends training from
+the 6-epoch LiDAR+Cam run (ep6, 0.6816 NDS) with a fresh 6-epoch
+cosine schedule. Uses `load_from` (not `--resume`) to get a fresh
+optimizer and scheduler.
+
+### Result (6 epochs)
+
+| Epoch | NDS | mAP | slope NDS | vs original ep6 |
+|---:|---:|---:|---:|---:|
+| input | 0.6816 | 0.6398 | - | - |
+| 1 | 0.6719 | 0.6261 | - | -0.0097 |
+| 2 | 0.6761 | 0.6330 | +0.0042 | -0.0055 |
+| 3 | 0.6766 | 0.6398 | +0.0005 | -0.0050 |
+| 4 | 0.6801 | 0.6403 | +0.0035 | -0.0015 |
+| 5 | 0.6805 | 0.6390 | +0.0004 | -0.0011 |
+| 6 | **0.6810** | 0.6386 | +0.0005 | **-0.0006** |
+
+Best: epoch 6 (NDS 0.6810 / mAP 0.6386).
+
+The warm restart did NOT exceed the original ep6 (0.6816). The
+fresh LR=2e-4 caused an ep1 regression of -0.0097 NDS (10,000x LR
+jump from the original cosine minimum of 2e-8). The model recovered
+non-monotonically (ep3 deceleration followed by ep4 acceleration)
+but settled 0.0006 NDS below the original.
+
+### Per-class AP@2.0 (warm restart ep6 vs original ep6)
+
+| Class | original ep6 | warm restart ep6 | Δ |
+|---|---:|---:|---:|
+| barrier | 0.7272 | 0.7346 | +0.0074 |
+| traffic_cone | 0.7587 | 0.7625 | +0.0038 |
+| bus | 0.8474 | 0.8506 | +0.0032 |
+| trailer | 0.5082 | 0.5086 | +0.0004 |
+| car | 0.9187 | 0.9184 | -0.0003 |
+| truck | 0.6818 | 0.6812 | -0.0006 |
+| construction_vehicle | 0.3198 | 0.3193 | -0.0005 |
+| pedestrian | 0.8471 | 0.8438 | -0.0033 |
+| motorcycle | 0.7492 | 0.7441 | -0.0051 |
+| bicycle | 0.5780 | 0.5577 | -0.0203 |
+
+Mixed tradeoffs: barrier/traffic_cone/bus improved, but
+bicycle/motorcycle regressed. The warm restart found a slightly
+different optimum, not a better one.
+
+### Conclusion
+
+The original ep6 (0.6816 / 0.6398) remains the best LiDAR+Cam
+model. The warm restart with lr=2e-4 was too aggressive for a
+converged model; a lower LR (e.g., 5e-5) would have been gentler.
+The LiDAR+Cam model has reached saturation at ~0.681 NDS /
+~0.640 mAP, which is within the range of published BEVFusion
+LiDAR+cam results on full nuScenes (~0.67-0.68 NDS).
